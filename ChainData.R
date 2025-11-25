@@ -243,15 +243,17 @@ length(unique(markov_stan$person_id))
 #     state = 0/1 -> 1/2, as Stan uses 1-based indexing
 #------------------------------------------------------
 stan_data <- list(
-  N        = nrow(markov_stan),##all data observations 
-  N_person = length(unique(markov_stan$person_id)),##unique number of individuals 
-  N_site   = length(unique(markov_stan$site_id)), #number of sites 
-  person_id = markov_stan$person_id,# child id 
-  site_id   = markov_stan$site_id,#site id 
-  state     = markov_stan$state_esbl + 1,       # carriage state
-  dt        = markov_stan$dt,
-  setting   = markov_stan$setting_prev          # hospital/community covariate
+  N         = nrow(markov_stan),##all data observations 
+  N_person  = length(unique(markov_stan$person_id)),##unique number of individuals 
+  N_site    = length(unique(markov_stan$site_id)), #number of sites 
+  person_id = markov_stan$person_id,   # child id 
+  site_id   = markov_stan$site_id,     # site id 
+  state_prev = markov_stan$state_prev + 1,      # ESBL at start of interval (0/1 → 1/2)
+  state      = markov_stan$state_esbl + 1,      # ESBL at end of interval   (0/1 → 1/2)
+  dt         = markov_stan$dt,
+  setting    = markov_stan$setting_prev         # hospital/community covariate
 )
+
 
 str(stan_data)
 
@@ -270,117 +272,150 @@ esbl_clean_filtered %>% count(site)
 ####Transitions per site:
 table(markov_long$site_id)
 
-stan_code <- "functions {
+stan_code <- "
+functions {
   // Continuous-time 2-state transition matrix
+  // Given hazards lambda01 (0→1) and lambda10 (1→0)
+  // and interval length t, compute P(t)
   matrix two_state_Q(real t, real lambda01, real lambda10) {
     real s = lambda01 + lambda10;
     real e = exp(-s * t);
 
     matrix[2,2] P;
 
-    P[1,1] = lambda10/s + lambda01/s * e;
-    P[1,2] = lambda01/s * (1 - e);
-
-    P[2,2] = lambda01/s + lambda10/s * e;
-    P[2,1] = lambda10/s * (1 - e);
+    // Standard 2-state CTMC transition probabilities:
+    P[1,1] = lambda10/s + lambda01/s * e;       // stay 0
+    P[1,2] = lambda01/s * (1 - e);              // 0 → 1
+    P[2,2] = lambda01/s + lambda10/s * e;       // stay 1
+    P[2,1] = lambda10/s * (1 - e);              // 1 → 0
 
     return P;
   }
 }
 
 data {
-  int<lower=1> N;                            // number of transitions (rows)
-  array[N] int<lower=1,upper=2> state;       // observed state (1 or 2)
-  array[N] real<lower=0> dt;                 // time between visits
-  int<lower=1> N_person;                     // number of unique children
+  int<lower=1> N;                            // number of transitions (interval rows)
+
+  // IMPORTANT:
+  // state_prev = ESBL at START of interval
+  // state      = ESBL at END of interval
+  // These come directly from R and MUST be used as-is
+  array[N] int<lower=1,upper=2> state_prev;
+  array[N] int<lower=1,upper=2> state;
+
+  array[N] real<lower=0> dt;                 // interval length (days)
+
+  int<lower=1> N_person;                     
   array[N] int<lower=1, upper=N_person> person_id;
-  array[N] int<lower=0,upper=1> setting;     // 0 = hospital, 1 = community
 
-  int<lower=1> N_site;                       // NEW: number of sites/villages
-  array[N] int<lower=1, upper=N_site> site_id;  // NEW: site index per row
+  array[N] int<lower=0,upper=1> setting;     // 0=hospital, 1=community (at START of interval)
+
+  int<lower=1> N_site;                       
+  array[N] int<lower=1, upper=N_site> site_id;
 }
-
 
 parameters {
-  // Baseline hazards (community) for acquisition and loss
-  real<lower=0> lambda01_base;       // acquisition (0→1) in community
-  real<lower=0> lambda10_base;       // loss (1→0) in community
 
-  // Hazard ratios for hospital vs community
-  real<lower=0> HR01_hosp;           // HR for acquisition in hospital
-  real<lower=0> HR10_hosp;           // HR for loss in hospital
+  // Baseline COMMUNITY log-hazards
+  // Acquisition and clearance hazard in the community
+  real log_lambda01_base;            // log(lambda 0→1 community)
+  real log_lambda10_base;            // log(lambda 1→0 community)
 
-  //  Site-level random effects on log hazard
-  vector[N_site] u_site;             // site-specific random effects
-  real<lower=0> sigma_site;          // SD of site effects
+  // Hospital log hazard ratios (hospital vs community)
+  real log_HR01_hosp;                // log(HR) for 0→1
+  real log_HR10_hosp;                // log(HR) for 1→0
+
+  // Site-level random effects added to log hazard
+  vector[N_site] u_site;             
+  real<lower=0> sigma_site;
 }
 
-
 model {
-  // Priors (you can refine these)
-  lambda01_base ~ normal(0, 1);
-  lambda10_base ~ normal(0, 1);
-  HR01_hosp ~ lognormal(0, 0.5);
-  HR10_hosp ~ lognormal(0, 0.5);
-  // priors for village random effects
-  u_site ~ normal(0, sigma_site);        // site-level deviations
-  sigma_site ~ normal(0, 0.5);           // half-normal prior on SD
 
+  // Priors on log-scale hazards (normal = full normal shape)
+  //lambda ~ Lognormal(meanlog = -3, sdlog = 1.5), median = exp(-3) = 0.0498
+  log_lambda01_base ~ normal(-3, 1.5);   // weakly informative
+  log_lambda10_base ~ normal(-3, 1.5);
 
-  for (n in 2:N) {
-    if (person_id[n] == person_id[n-1]) {
+  // Priors on log HRs
+  log_HR01_hosp ~ normal(0, 0.7);
+  log_HR10_hosp ~ normal(0, 0.7);
 
-      int prev_state = state[n-1];   // previous observed state (1 or 2)
-      int curr_state = state[n];     // current state
-      int s0 = setting[n];           // 0 = hospital, 1 = community
-      int j  = site_id[n];             // site index for this row
+  // Random effects
+  u_site ~ normal(0, sigma_site);
+  sigma_site ~ exponential(1);
 
+  //----------------------------------------------------
+  // Likelihood: one row per interval (correct)
+  //----------------------------------------------------
+  for (n in 1:N) {
 
-      // Log-hazards according to setting
-     // Village effect only applies in community
-      real log_lambda01;
-      real log_lambda10;
+    int prev_state = state_prev[n];  // correct previous state
+    int curr_state = state[n];       // correct current state
+    int s0 = setting[n];             // setting at start of interval
+    int j  = site_id[n];             // site index
 
-      if (s0 == 0) {
-      log_lambda01 = log(lambda01_base) + log(HR01_hosp)+u_site[j];    //  u_site added to both setting
-      log_lambda10 = log(lambda10_base) + log(HR10_hosp)+u_site[j];
-      } else {
-      log_lambda01 = log(lambda01_base) + u_site[j];
-      log_lambda10 = log(lambda10_base) + u_site[j];
-      }
-     // then later on we can add village 
+    //----------------------------------------------------
+    // Compute log-hazards for this interval
+    //----------------------------------------------------
 
-      // Convert to positive intensities
-      real lambda01 = exp(log_lambda01);
-      real lambda10 = exp(log_lambda10);
+    // baseline community hazards + site RE
+    real log_l01 = log_lambda01_base + u_site[j];
+    real log_l10 = log_lambda10_base + u_site[j];
 
-      // Transition probability matrix over dt[n]
-      matrix[2,2] P = two_state_Q(dt[n], lambda01, lambda10);
-
-      // Log-likelihood contribution
-      target += log(P[prev_state, curr_state] + 1e-12);
-
+    // add hospital effect if interval starts in hospital
+    if (s0 == 0) {                   // 0=hospital
+      log_l01 += log_HR01_hosp;
+      log_l10 += log_HR10_hosp;
     }
+
+    // transform to positive hazards
+    real lambda01 = exp(log_l01);
+    real lambda10 = exp(log_l10);
+
+    // transition probability over dt
+    matrix[2,2] P = two_state_Q(dt[n], lambda01, lambda10);
+
+    // contribute log-likelihood
+    target += log(P[prev_state, curr_state] + 1e-12);
   }
 }
 
+
 generated quantities {
   // Define community & hospital hazards from the parameters
-  real lambda01_comm = lambda01_base;
-  real lambda10_comm = lambda10_base;
-  real lambda01_hosp = lambda01_base * HR01_hosp;
-  real lambda10_hosp = lambda10_base * HR10_hosp;
+  //  lambda01_comm : the baseline (community) acquisition hazard (per day)
+  //  lambda10_comm : the baseline (community) decolonisation hazard (per day)
+  //  lambda01_hosp : the hospital acquisition hazard at the moment
+  //  lambda10_hosp : the hospital decolonisation hazard at the moment
+  //
+  // daily_acquisition_comm, daily_clearance_comm, daily_acquisition_hosp, daily_clearance_hosp 
+  //   are simple aliases for these hazards (they’re “daily” because dt is in days)
+  //
+  // HR_acquisition, HR_clearance = hazard ratios (hospital vs community) 
+  //   for acquisition and clearance.
+  //
+  // mean_colonised_duration, mean_uncolonised_duration = the mean durations 
+  //   in the community state under an exponential assumption (1 / hazard).
 
-  // Daily rates (for convenience)
+  // convert log-scale parameters to natural-scale hazards
+  real lambda01_comm = exp(log_lambda01_base);
+  real lambda10_comm = exp(log_lambda10_base);
+
+  // hazard ratios in natural scale
+  real HR_acquisition = exp(log_HR01_hosp);
+  real HR_clearance   = exp(log_HR10_hosp);
+
+  // hospital hazards = community * HR
+  real lambda01_hosp = lambda01_comm * HR_acquisition;
+  real lambda10_hosp = lambda10_comm * HR_clearance;
+
+  // Daily rates (for convenience) - same as hazards here
   real daily_acquisition_comm = lambda01_comm;
   real daily_clearance_comm   = lambda10_comm;
 
   real daily_acquisition_hosp = lambda01_hosp;
   real daily_clearance_hosp   = lambda10_hosp;
-
-  // Hazard ratios (hospital vs community)
-  real HR_acquisition = HR01_hosp;
-  real HR_clearance   = HR10_hosp;
 
   // Mean durations in community baseline
   real mean_colonised_duration    = 1 / lambda10_comm;
@@ -393,14 +428,15 @@ generated quantities {
 
   for (n in 1:N) {
     int j = site_id[n];
+    int s0 = setting[n];
 
     // site-specific log-hazards in community
-    real log_lambda01_comm_site = log(lambda01_comm) + u_site[j];
-    real log_lambda10_comm_site = log(lambda10_comm) + u_site[j];
+    real log_lambda01_comm_site = log_lambda01_base + u_site[j];
+    real log_lambda10_comm_site = log_lambda10_base + u_site[j];
 
     // site-specific log-hazards in hospital
-    real log_lambda01_hosp_site = log_lambda01_comm_site + log(HR01_hosp);
-    real log_lambda10_hosp_site = log_lambda10_comm_site + log(HR10_hosp);
+    real log_lambda01_hosp_site = log_lambda01_comm_site + log_HR01_hosp;
+    real log_lambda10_hosp_site = log_lambda10_comm_site + log_HR10_hosp;
 
     real lambda01_comm_site = exp(log_lambda01_comm_site);
     real lambda10_comm_site = exp(log_lambda10_comm_site);
@@ -408,11 +444,11 @@ generated quantities {
     real lambda10_hosp_site = exp(log_lambda10_hosp_site);
 
     // Pick the right hazard for this interval based on setting[n]
-    real lambda01_site = (setting[n] == 0)
+    real lambda01_site = (s0 == 0)
       ? lambda01_hosp_site
       : lambda01_comm_site;
 
-    real lambda10_site = (setting[n] == 0)
+    real lambda10_site = (s0 == 0)
       ? lambda10_hosp_site
       : lambda10_comm_site;
 
@@ -427,7 +463,6 @@ generated quantities {
 }
 
 
-
 "
 stan_model_simple <- rstan::stan_model(model_code = stan_code)
 
@@ -440,7 +475,7 @@ fit <- rstan::sampling(
   cores = 4,
   seed = 2025,
   verbose = TRUE,
-  control = list(adapt_delta = 0.99, max_treedepth = 12))
+  control = list(adapt_delta = 0.9999, max_treedepth = 15))
 
 print(fit)
 
