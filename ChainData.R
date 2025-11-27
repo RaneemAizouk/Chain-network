@@ -11,7 +11,6 @@
 #Carriage status (ESBL negative/positive) → state_esbl (0/1)
 #Setting (hospital vs community) → setting_state (0/1)
 #Cohort (follow-up vs controls) → group (follow_up / control, or 0/1 if you want)
-
 library(tidyverse)
 library(lubridate)
 library(readxl)
@@ -23,62 +22,38 @@ esbl <- read_excel("/Users/raizouk/Desktop/Oxford/Caroline/data/kenya_esbl copy.
 names(esbl)
 
 #------------------------------------------------------
-# 2. Clean IDs & dates, add readable date column
-#    - Keep original date_collect
-#    - Create numeric Excel date + actual Date
+# 2. Clean IDs & dates
 #------------------------------------------------------
 esbl_clean <- esbl %>%
   mutate(
-    # Ensure record_id is not numeric (avoid 1e+07 display)
     record_id = as.character(record_id),
-    
-    # Convert "." or text to NA, then to numeric Excel format
     date_collect_num = suppressWarnings(as.numeric(na_if(date_collect, "."))),
-    
-    # Convert Excel serial numbers to actual calendar dates
     actual_date = as.Date(date_collect_num, origin = "1899-12-30")
   ) %>%
-  # Place actual_date next to date_collect for clarity
-  relocate(actual_date, date_collect, .after = time_point)
+  relocate(actual_date, date_collect, .after = time_point) %>%
+  filter(!is.na(actual_date),
+         actual_date >= as.Date("2016-01-01"))
 
 #------------------------------------------------------
-# 3. Number of observations per child
-#    - n_obs = how many rows each child has
-#    - obs_summary = how many children have 1,2,3,... obs
+# 3. Observation counts per child
 #------------------------------------------------------
 obs_per_child <- esbl_clean %>%
   group_by(record_id) %>%
   summarize(n_obs = n(), .groups = "drop") %>%
   arrange(n_obs)
 
-obs_summary <- obs_per_child %>%
-  count(n_obs, name = "num_children")
-
-obs_summary   # frequency of children by number of observations
-
-# Total number of unique individuals
-total_children <- esbl_clean %>%
-  distinct(record_id) %>%
-  nrow()
-total_children
+obs_summary <- obs_per_child %>% count(n_obs)
+total_children <- n_distinct(esbl_clean$record_id)
 
 #------------------------------------------------------
-# 4. Keep only children with ≥ 2 observations
-#    (remove single-observation children, who
-#     cannot contribute time transitions)
+# 4. Keep children with ≥ 2 samples
 #------------------------------------------------------
 esbl_clean_filtered <- esbl_clean %>%
   inner_join(obs_per_child %>% filter(n_obs >= 2), by = "record_id")
 
-# Check filtering worked: all n_obs >= 2
-esbl_clean_filtered %>%
-  group_by(record_id) %>%
-  summarize(n_obs = n(), .groups = "drop") %>%
-  arrange(n_obs)
-
-# How many individuals remain
-n_distinct(esbl_clean_filtered$record_id)   # e.g. 698
-################## 4.1) How many are missing in each group
+#------------------------------------------------------
+# 5. Recode timepoints
+#------------------------------------------------------
 esbl_clean_filtered <- esbl_clean_filtered %>%
   mutate(
     time_point = case_when(
@@ -89,87 +64,13 @@ esbl_clean_filtered <- esbl_clean_filtered %>%
       time_point == "day180" ~ "D180",
       time_point == "readm"  ~ "Readmission",
       time_point == "comm"   ~ "CommunityControl",
-      TRUE ~ time_point
+      TRUE                   ~ time_point
     ),
     group = ifelse(time_point == "CommunityControl", "control", "follow_up")
   )
-table(esbl_clean_filtered$group, useNA = "ifany")
-n_followup_children <- esbl_clean_filtered %>%
-  filter(group == "follow_up") %>%
-  distinct(record_id) %>%
-  nrow()
-visit_counts <- esbl_clean_filtered %>%
-  filter(
-    group == "follow_up",
-    time_point %in% c("Admission", "Discharge", "D45", "D90", "D180")
-  ) %>%
-  distinct(record_id, time_point) %>%
-  count(time_point, name = "n_with_visit") %>%
-  mutate(
-    n_children_total = n_followup_children,
-    n_missing = n_children_total - n_with_visit,
-    prop_missing = n_missing / n_children_total
-  )
-
-visit_counts
-########How Many Remaining Children Have BOTH Admission and Discharge?
-adm_disch_pairs <- esbl_clean_filtered %>%
-  filter(
-    group == "follow_up",
-    time_point %in% c("Admission", "Discharge")
-  ) %>%
-  distinct(record_id, time_point) %>%            # keep one per child per type
-  tidyr::pivot_wider(
-    names_from = time_point,
-    values_from = time_point,
-    values_fill = NA
-  ) %>%
-  mutate(
-    has_adm = !is.na(Admission),
-    has_disch = !is.na(Discharge)
-  ) %>%
-  filter(has_adm & has_disch)
-
-# Number of children with BOTH Admission and Discharge
-n_adm_disch <- nrow(adm_disch_pairs)
-n_adm_disch
-
 
 #------------------------------------------------------
-# 5. Recode timepoints, define groups and setting (hospital vs community)
-#    (this keeps your original "idea" block and just
-#     applies it to the filtered data)
-#------------------------------------------------------
-esbl_clean_filtered <- esbl_clean_filtered %>%
-  mutate(
-    # Recode time_point to readable labels
-    time_point = case_when(
-      time_point == "adm"    ~ "Admission",
-      time_point == "disch"  ~ "Discharge",
-      time_point == "day45"  ~ "D45",
-      time_point == "day90"  ~ "D90",
-      time_point == "day180" ~ "D180",
-      time_point == "readm"  ~ "Readmission",
-      time_point == "comm"   ~ "CommunityControl",
-      TRUE                   ~ time_point  # keep as-is if already recoded
-    ),
-    
-    # Cohort group: community controls vs followed-up children
-    group = ifelse(time_point == "CommunityControl", "control", "follow_up"),
-    
-    
-    # Define state for setting: hospital vs community
-    # (your original definition preserved)
-    setting_state = case_when(
-      time_point %in% c("Admission", "Discharge", "Readmission") ~ 0,   # hospital
-      time_point %in% c("D45", "D90", "D180") ~ 1,  # community
-      TRUE ~ NA_real_
-    )
-  )
-###how to consider readmission is it additional sample /follow up for those ewho have already sampled 
-unique(esbl_clean$time_point)
-#------------------------------------------------------
-# 6. ESBL biological state: 0 = negative, 1 = positive
+# 6. ESBL state (0/1)
 #------------------------------------------------------
 esbl_clean_filtered <- esbl_clean_filtered %>%
   mutate(
@@ -180,279 +81,248 @@ esbl_clean_filtered <- esbl_clean_filtered %>%
     )
   )
 
-table(esbl_clean_filtered$state_esbl, useNA = "ifany")   # Good check
-
 #------------------------------------------------------
-# 7. Sort data by child and chronological time
-#    Use actual_date for ordering and dt
+# 7. Sort chronologically
 #------------------------------------------------------
 esbl_clean_filtered <- esbl_clean_filtered %>%
   arrange(record_id, actual_date, time_point)
 
+#------------------------------------------------------
+# 8. Extract discharge dates
+#------------------------------------------------------
+discharge_dates <- esbl_clean_filtered %>%
+  group_by(record_id) %>%
+  summarise(
+    discharge_date = case_when(
+      any(time_point == "Discharge") ~ min(actual_date[time_point == "Discharge"], na.rm = TRUE),
+      any(time_point %in% c("D45", "D90", "D180")) ~ min(actual_date[time_point %in% c("D45", "D90", "D180")], na.rm = TRUE),
+      TRUE ~ NA_Date_
+    ),
+    .groups = "drop"
+  )
 
+esbl_clean_filtered <- esbl_clean_filtered %>% left_join(discharge_dates, "record_id")
 
 #------------------------------------------------------
-# 9. Markov long dataset 
-#    - one row per child per transition
-#    - includes dt and previous state and setting
-#    - filters out missing states and dt<=0
+# 9. Pre-split intervals
 #------------------------------------------------------
-markov_long <- esbl_clean_filtered %>%
-  filter(group == "follow_up") %>%          # only followed-up children
+intervals_raw <- esbl_clean_filtered %>%
+  filter(group == "follow_up",
+         time_point != "Readmission") %>%
   arrange(record_id, actual_date) %>%
   group_by(record_id) %>%
   mutate(
-    prev_date    = lag(actual_date),
-    state_prev   = lag(state_esbl),
-    dt           = as.numeric(actual_date - prev_date),
-    setting_prev = lag(setting_state)
+    t_start     = actual_date,
+    t_end       = lead(actual_date),
+    state_start = state_esbl,
+    state_end   = lead(state_esbl),
+    tp_start    = time_point
   ) %>%
   ungroup() %>%
-  filter(
-    !is.na(state_prev),
-    !is.na(state_esbl),
-    !is.na(setting_prev),    #  use the start-of-interval setting
-    dt > 0
-  ) %>%
-  mutate(
-    person_id = as.integer(factor(record_id)),
-    site_id   = as.integer(factor(site))
+  filter(!is.na(t_end))
+
+#------------------------------------------------------
+# 10. Interval-splitting function
+#------------------------------------------------------
+split_interval <- function(row) {
+  t1 <- row$t_start
+  t2 <- row$t_end
+  d  <- row$discharge_date
+  
+  if (is.na(d) || !(t1 < d & t2 > d)) {
+    setting = ifelse(!is.na(d) && t1 < d, 0, 1)
+    return(tibble(
+      record_id   = row$record_id,
+      site        = row$site,
+      t_start     = t1,
+      t_end       = t2,
+      state_start = row$state_start,
+      state_end   = row$state_end,
+      setting_prev = setting,
+      dt = as.numeric(t2 - t1)
+    ))
+  }
+  
+  tibble(
+    record_id   = row$record_id,
+    site        = row$site,
+    t_start     = c(t1, d),
+    t_end       = c(d,  t2),
+    state_start = c(row$state_start, NA),
+    state_end   = c(NA, row$state_end),
+    setting_prev = c(0, 1),
+    dt = c(as.numeric(d - t1), as.numeric(t2 - d))
   )
-
-table(markov_long$state_prev, markov_long$state_esbl)
-summary(markov_long$dt)
-length(unique(markov_long$person_id))
-##check sites
-markov_long %>%
-  distinct(site_id, site) %>%
-  arrange(site_id)
+}
 
 #------------------------------------------------------
-# 10. Final dataset for Stan (markov_stan idea preserved,
-#     but now markov_long is already filtered)
+# 11. Apply splitting
 #------------------------------------------------------
-markov_stan <- markov_long   # already filtered as desired
+markov_split <- intervals_raw %>%
+  rowwise() %>% do(split_interval(.)) %>%
+  ungroup() %>%
+  filter(dt > 0)
 
-# Sanity check
-length(unique(markov_stan$person_id))
+#------------------------------------------------------
+# 12. Stan-ready dataset
+#------------------------------------------------------
+markov_stan <- markov_split %>%
+  mutate(
+    person_id  = as.integer(factor(record_id)),
+    site_id    = as.integer(factor(site)),
+    state_prev = state_start + 1,
+    state      = state_end + 1
+  ) %>%
+  filter(!is.na(state_prev), !is.na(state), dt > 0)
 
-#------------------------------------------------------
-# 11. Build Stan data list
-#     N = number of transitions (rows in markov_stan)
-#     N_person = number of unique children
-#     state = 0/1 -> 1/2, as Stan uses 1-based indexing
-#------------------------------------------------------
-stan_data <- list(
-  N         = nrow(markov_stan),##all data observations 
-  N_person  = length(unique(markov_stan$person_id)),##unique number of individuals 
-  N_site    = length(unique(markov_stan$site_id)), #number of sites 
-  person_id = markov_stan$person_id,   # child id 
-  site_id   = markov_stan$site_id,     # site id 
-  state_prev = markov_stan$state_prev + 1,      # ESBL at start of interval (0/1 → 1/2)
-  state      = markov_stan$state_esbl + 1,      # ESBL at end of interval   (0/1 → 1/2)
-  dt         = markov_stan$dt,
-  setting    = markov_stan$setting_prev         # hospital/community covariate
+#====================================================================
+# 13. NEW SECTION — Fraction of children acquiring ESBL-E in hospital
+#====================================================================
+
+# (A) Mark acquisition events
+markov_split <- markov_split %>%
+  mutate(acquisition = as.integer(state_start == 0 & state_end == 1))
+
+# (B) Children at risk in hospital (start uncolonised)
+children_at_risk_hosp <- markov_split %>%
+  filter(setting_prev == 0, state_start == 0) %>%
+  distinct(record_id) %>%
+  pull(record_id)
+
+# (C) Children who acquired ESBL-E in hospital
+children_acquired_hosp <- markov_split %>%
+  filter(setting_prev == 0, acquisition == 1) %>%
+  distinct(record_id) %>%
+  pull(record_id)
+
+# (D) Fraction
+frac_acquired_hosp <- length(children_acquired_hosp) / length(children_at_risk_hosp)
+
+# (E) Summary table
+acq_summary <- tibble(
+  setting = "Hospital",
+  children_at_risk = length(children_at_risk_hosp),
+  children_acquired = length(children_acquired_hosp),
+  fraction = frac_acquired_hosp,
+  percent = round(100 * frac_acquired_hosp, 1)
 )
 
+print(acq_summary)
 
-str(stan_data)
+#------------------------------------------------------
+# 14. Inspect individuals (optional)
+#------------------------------------------------------
+esbl_clean_filtered %>%
+  filter(record_id == "10003203") %>%
+  arrange(actual_date) %>%
+  select(record_id, time_point, actual_date, esbl_result, discharge_date)
 
-
-table(markov_long$site_id)
-markov_long %>% 
-  group_by(site) %>%
-  summarize(mean_state = mean(state_esbl))
-###children per site 
-markov_long %>%
-  distinct(record_id, site) %>%
-  count(site)
-#######Observations per site
-esbl_clean_filtered %>% count(site)
-
-####Transitions per site:
-table(markov_long$site_id)
+esbl_clean_filtered %>% 
+  filter(record_id == "10003224") %>%
+  select(record_id, time_point, actual_date, discharge_date)
 
 stan_code <- "
 functions {
-  // Continuous-time 2-state transition matrix
-  // Given hazards lambda01 (0→1) and lambda10 (1→0)
-  // and interval length t, compute P(t)
   matrix two_state_Q(real t, real lambda01, real lambda10) {
     real s = lambda01 + lambda10;
     real e = exp(-s * t);
-
     matrix[2,2] P;
-
-    // Standard 2-state CTMC transition probabilities:
-    P[1,1] = lambda10/s + lambda01/s * e;       // stay 0
-    P[1,2] = lambda01/s * (1 - e);              // 0 → 1
-    P[2,2] = lambda01/s + lambda10/s * e;       // stay 1
-    P[2,1] = lambda10/s * (1 - e);              // 1 → 0
-
+    P[1,1] = lambda10/s + lambda01/s * e;
+    P[1,2] = lambda01/s * (1 - e);
+    P[2,2] = lambda01/s + lambda10/s * e;
+    P[2,1] = lambda10/s * (1 - e);
     return P;
   }
 }
 
 data {
-  int<lower=1> N;                            // number of transitions (interval rows)
-
-  // IMPORTANT:
-  // state_prev = ESBL at START of interval
-  // state      = ESBL at END of interval
-  // These come directly from R and MUST be used as-is
+  int<lower=1> N;
   array[N] int<lower=1,upper=2> state_prev;
   array[N] int<lower=1,upper=2> state;
-
-  array[N] real<lower=0> dt;                 // interval length (days)
-
-  int<lower=1> N_person;                     
-  array[N] int<lower=1, upper=N_person> person_id;
-
-  array[N] int<lower=0,upper=1> setting;     // 0=hospital, 1=community (at START of interval)
-
-  int<lower=1> N_site;                       
-  array[N] int<lower=1, upper=N_site> site_id;
+  array[N] real<lower=0> dt;
+  int<lower=1> N_person;
+  array[N] int<lower=1,upper=N_person> person_id;
+  array[N] int<lower=0,upper=1> setting;
+  int<lower=1> N_site;
+  array[N] int<lower=1,upper=N_site> site_id;
 }
 
 parameters {
-
-  // Baseline COMMUNITY log-hazards
-  // Acquisition and clearance hazard in the community
-  real log_lambda01_base;            // log(lambda 0→1 community)
-  real log_lambda10_base;            // log(lambda 1→0 community)
-
-  // Hospital log hazard ratios (hospital vs community)
-  real log_HR01_hosp;                // log(HR) for 0→1
-  real log_HR10_hosp;                // log(HR) for 1→0
-
-  // Site-level random effects added to log hazard
-  vector[N_site] u_site;             
+  real log_lambda01_base;
+  real log_lambda10_base;
+  real log_HR01_hosp;
+  real log_HR10_hosp;
+  vector[N_site] u_site;
   real<lower=0> sigma_site;
 }
 
 model {
-
-  // Priors on log-scale hazards (normal = full normal shape)
-  //lambda ~ Lognormal(meanlog = -3, sdlog = 1.5), median = exp(-3) = 0.0498
-  log_lambda01_base ~ normal(-3, 1.5);   // weakly informative
+  log_lambda01_base ~ normal(-3, 1.5);
   log_lambda10_base ~ normal(-3, 1.5);
-
-  // Priors on log HRs
   log_HR01_hosp ~ normal(0, 0.7);
   log_HR10_hosp ~ normal(0, 0.7);
-
-  // Random effects
   u_site ~ normal(0, sigma_site);
   sigma_site ~ exponential(1);
 
-  //----------------------------------------------------
-  // Likelihood: one row per interval (correct)
-  //----------------------------------------------------
   for (n in 1:N) {
+    int prev_state = state_prev[n];
+    int curr_state = state[n];
+    int s0 = setting[n];
+    int j  = site_id[n];
 
-    int prev_state = state_prev[n];  // correct previous state
-    int curr_state = state[n];       // correct current state
-    int s0 = setting[n];             // setting at start of interval
-    int j  = site_id[n];             // site index
-
-    //----------------------------------------------------
-    // Compute log-hazards for this interval
-    //----------------------------------------------------
-
-    // baseline community hazards + site RE
     real log_l01 = log_lambda01_base + u_site[j];
     real log_l10 = log_lambda10_base + u_site[j];
 
-    // add hospital effect if interval starts in hospital
-    if (s0 == 0) {                   // 0=hospital
+    if (s0 == 0) {
       log_l01 += log_HR01_hosp;
       log_l10 += log_HR10_hosp;
     }
 
-    // transform to positive hazards
     real lambda01 = exp(log_l01);
     real lambda10 = exp(log_l10);
-
-    // transition probability over dt
     matrix[2,2] P = two_state_Q(dt[n], lambda01, lambda10);
-
-    // contribute log-likelihood
     target += log(P[prev_state, curr_state] + 1e-12);
   }
 }
 
-
 generated quantities {
-  // Define community & hospital hazards from the parameters
-  //  lambda01_comm : the baseline (community) acquisition hazard (per day)
-  //  lambda10_comm : the baseline (community) decolonisation hazard (per day)
-  //  lambda01_hosp : the hospital acquisition hazard at the moment
-  //  lambda10_hosp : the hospital decolonisation hazard at the moment
-  //
-  // daily_acquisition_comm, daily_clearance_comm, daily_acquisition_hosp, daily_clearance_hosp 
-  //   are simple aliases for these hazards (they’re “daily” because dt is in days)
-  //
-  // HR_acquisition, HR_clearance = hazard ratios (hospital vs community) 
-  //   for acquisition and clearance.
-  //
-  // mean_colonised_duration, mean_uncolonised_duration = the mean durations 
-  //   in the community state under an exponential assumption (1 / hazard).
-
-  // convert log-scale parameters to natural-scale hazards
   real lambda01_comm = exp(log_lambda01_base);
   real lambda10_comm = exp(log_lambda10_base);
-
-  // hazard ratios in natural scale
   real HR_acquisition = exp(log_HR01_hosp);
   real HR_clearance   = exp(log_HR10_hosp);
 
-  // hospital hazards = community * HR
   real lambda01_hosp = lambda01_comm * HR_acquisition;
   real lambda10_hosp = lambda10_comm * HR_clearance;
 
-  // Daily rates (for convenience) - same as hazards here
   real daily_acquisition_comm = lambda01_comm;
   real daily_clearance_comm   = lambda10_comm;
-
   real daily_acquisition_hosp = lambda01_hosp;
   real daily_clearance_hosp   = lambda10_hosp;
 
-  // Mean durations in community baseline
-  real mean_colonised_duration    = 1 / lambda10_comm;
-  real mean_uncolonised_duration  = 1 / lambda01_comm;
+  real mean_colonised_duration   = 1 / lambda10_comm;
+  real mean_uncolonised_duration = 1 / lambda01_comm;
 
-  // fully model-based overall acquisition & clearance rates
-  real total_time      = 0;
-  real num_acq_hazard  = 0;
-  real num_clr_hazard  = 0;
+  real total_time = 0;
+  real num_acq_hazard = 0;
+  real num_clr_hazard = 0;
 
   for (n in 1:N) {
     int j = site_id[n];
     int s0 = setting[n];
 
-    // site-specific log-hazards in community
-    real log_lambda01_comm_site = log_lambda01_base + u_site[j];
-    real log_lambda10_comm_site = log_lambda10_base + u_site[j];
+    real log_l01_comm_site = log_lambda01_base + u_site[j];
+    real log_l10_comm_site = log_lambda10_base + u_site[j];
+    real log_l01_hosp_site = log_l01_comm_site + log_HR01_hosp;
+    real log_l10_hosp_site = log_l10_comm_site + log_HR10_hosp;
 
-    // site-specific log-hazards in hospital
-    real log_lambda01_hosp_site = log_lambda01_comm_site + log_HR01_hosp;
-    real log_lambda10_hosp_site = log_lambda10_comm_site + log_HR10_hosp;
+    real lambda01_comm_site = exp(log_l01_comm_site);
+    real lambda10_comm_site = exp(log_l10_comm_site);
+    real lambda01_hosp_site = exp(log_l01_hosp_site);
+    real lambda10_hosp_site = exp(log_l10_hosp_site);
 
-    real lambda01_comm_site = exp(log_lambda01_comm_site);
-    real lambda10_comm_site = exp(log_lambda10_comm_site);
-    real lambda01_hosp_site = exp(log_lambda01_hosp_site);
-    real lambda10_hosp_site = exp(log_lambda10_hosp_site);
+    real lambda01_site = (s0 == 0) ? lambda01_hosp_site : lambda01_comm_site;
+    real lambda10_site = (s0 == 0) ? lambda10_hosp_site : lambda10_comm_site;
 
-    // Pick the right hazard for this interval based on setting[n]
-    real lambda01_site = (s0 == 0)
-      ? lambda01_hosp_site
-      : lambda01_comm_site;
-
-    real lambda10_site = (s0 == 0)
-      ? lambda10_hosp_site
-      : lambda10_comm_site;
-
-    // Hazard * time contributions
     num_acq_hazard += lambda01_site * dt[n];
     num_clr_hazard += lambda10_site * dt[n];
     total_time     += dt[n];
@@ -461,25 +331,26 @@ generated quantities {
   real daily_acquisition_overall = num_acq_hazard / total_time;
   real daily_clearance_overall   = num_clr_hazard / total_time;
 }
-
-
 "
+
 stan_model_simple <- rstan::stan_model(model_code = stan_code)
 
 fit <- rstan::sampling(
   object = stan_model_simple,
   data = stan_data,
-  iter = 2000,
-  warmup = 1000,
+  iter = 6000,
+  warmup = 3000,
   chains = 4,
   cores = 4,
   seed = 2025,
   verbose = TRUE,
-  control = list(adapt_delta = 0.9999, max_treedepth = 15))
+  control = list(adapt_delta = 0.9999, max_treedepth = 15)
+)
 
-print(fit)
-
-
+print(fit, digits_summary = 4)
+rstan::check_hmc_diagnostics(fit)
+print(frac_acquired_hosp)
+##########################################
 
 
 names(esbl_clean_filtered)
