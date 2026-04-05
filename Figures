@@ -848,3 +848,103 @@ print(season_res$plot)
 ggsave("../figs/seasonal_res.png", season_res$plot,
        dpi = 300, 
        width = 21.59 / 2.54, height = 13.32 / 2.54)
+###############################################################################
+####Visualise the change in acquisition incidence following antibiotic exposures
+
+library(tidyverse)
+library(rstan)
+library(patchwork)
+
+#------------------------------------------------------------
+# Extract posterior draws
+#------------------------------------------------------------
+draws <- rstan::extract(
+  fit_seasonal,
+  pars = c("beta_abx_high_01", "beta_abx_low_01", "beta_cp_abx_high_01")
+)
+
+#------------------------------------------------------------
+# Build dose-response curves
+#------------------------------------------------------------
+build_abx_curve <- function(beta_draws, days_grid) {
+  map_dfr(days_grid, function(d) {
+    hr <- exp(beta_draws * log1p(d))
+    
+    tibble(
+      days = d,
+      median = median(hr),
+      lo = quantile(hr, 0.025),
+      hi = quantile(hr, 0.975)
+    )
+  })
+}
+
+days_grid <- seq(0, 30, by = 1)
+
+high_curve <- build_abx_curve(draws$beta_abx_high_01, days_grid)
+low_curve  <- build_abx_curve(draws$beta_abx_low_01,  days_grid)
+
+##Add interaction with colonisation pressure (important!)
+build_high_cp_curve <- function(beta_high, beta_int, cp, days_grid) {
+  map_dfr(days_grid, function(d) {
+    hr <- exp((beta_high + cp * beta_int) * log1p(d))
+    
+    tibble(
+      days = d,
+      median = median(hr),
+      lo = quantile(hr, 0.025),
+      hi = quantile(hr, 0.975),
+      cp = paste0("CP=", cp)
+    )
+  })
+}
+
+high_cp0   <- build_high_cp_curve(draws$beta_abx_high_01, draws$beta_cp_abx_high_01, 0.00, days_grid)
+high_cp25  <- build_high_cp_curve(draws$beta_abx_high_01, draws$beta_cp_abx_high_01, 0.25, days_grid)
+high_cp50  <- build_high_cp_curve(draws$beta_abx_high_01, draws$beta_cp_abx_high_01, 0.50, days_grid)
+
+high_cp_df <- bind_rows(high_cp0, high_cp25, high_cp50)
+###High-risk antibiotics
+
+p_high <- ggplot(high_curve, aes(x = days, y = median)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#CB181D", alpha = 0.25) +
+  geom_line(color = "#CB181D", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    title = "High-risk antibiotics",
+    x = "Days of exposure",
+    y = "Hazard ratio (vs no exposure)"
+  ) +
+  theme_minimal(base_size = 13)
+##Low-risk antibiotics
+p_low <- ggplot(low_curve, aes(x = days, y = median)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#636363", alpha = 0.25) +
+  geom_line(color = "#636363", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    title = "Low-risk antibiotics",
+    x = "Days of exposure",
+    y = "Hazard ratio (vs no exposure)"
+  ) +
+  theme_minimal(base_size = 13)
+##Interaction plot (this is the most interesting scientifically)
+
+p_high_cp <- ggplot(high_cp_df, aes(x = days, y = median, color = cp, fill = cp)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    title = "High-risk antibiotics × colonisation pressure",
+    x = "Days of exposure",
+    y = "Hazard ratio"
+  ) +
+  theme_minimal(base_size = 13)
+
+#####Combine into slide
+
+p_slide2 <- p_high | p_low
+p_slide2
+
+# or
+p_full <- (p_high | p_low) / p_high_cp
+p_full
