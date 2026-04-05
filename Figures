@@ -1,0 +1,850 @@
+###############################################################################
+# Baseline acquisition incidence + decolonisation time
+# Forest-plot style figure for slide use version 2, three panels
+###############################################################################
+
+library(tidyverse)
+library(rstan)
+library(patchwork)
+
+#---------------------------------------------------------------------
+# Helper: posterior summary
+#---------------------------------------------------------------------
+qsum <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  tibble(
+    median = median(x, na.rm = TRUE),
+    lo = quantile(x, 0.025, na.rm = TRUE),
+    hi = quantile(x, 0.975, na.rm = TRUE)
+  )
+}
+
+#---------------------------------------------------------------------
+# Build draw-level baseline quantities
+# - acquisition incidence is converted to per person-month
+# - decolonisation is shown as mean days = 1 / lambda10
+#---------------------------------------------------------------------
+build_baseline_draws <- function(fit, site_names = NULL, days_per_month = 30.44) {
+  draws <- rstan::extract(
+    fit,
+    pars = c("log_lambda01_comm", "log_lambda01_hosp", "log_lambda10_base", "u_site")
+  )
+  
+  n_sites <- dim(draws$u_site)[2]
+  if (is.null(site_names)) site_names <- paste0("Site ", seq_len(n_sites))
+  if (length(site_names) != n_sites) {
+    stop("site_names must have length equal to the number of sites in the fit")
+  }
+  
+  overall <- tibble(
+    site = "Overall",
+    parameter = c(
+      "Post-discharge acquisition",
+      "Hospital acquisition",
+      "Mean decolonisation time (days)"
+    ),
+    value = list(
+      days_per_month * exp(draws$log_lambda01_comm),
+      days_per_month * exp(draws$log_lambda01_hosp),
+      1 / exp(draws$log_lambda10_base)
+    )
+  ) %>%
+    unnest(value)
+  
+  site_specific <- map_dfr(seq_len(n_sites), function(s) {
+    tibble(
+      site = site_names[s],
+      parameter = c(
+        "Post-discharge acquisition",
+        "Hospital acquisition",
+        "Mean decolonisation time (days)"
+      ),
+      value = list(
+        days_per_month * exp(draws$log_lambda01_comm + draws$u_site[, s]),
+        days_per_month * exp(draws$log_lambda01_hosp + draws$u_site[, s]),
+        1 / exp(draws$log_lambda10_base + draws$u_site[, s])
+      )
+    ) %>%
+      unnest(value)
+  })
+  
+  bind_rows(overall, site_specific)
+}
+
+#---------------------------------------------------------------------
+# Summarise draw-level quantities
+#---------------------------------------------------------------------
+summarise_draws <- function(df) {
+  df %>%
+    group_by(site, parameter) %>%
+    summarise(
+      median = median(value, na.rm = TRUE),
+      lo = quantile(value, 0.025, na.rm = TRUE),
+      hi = quantile(value, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+#---------------------------------------------------------------------
+# Forest-plot panel for a single rate outcome
+# - Use this to split hospital and post-discharge into separate panels
+#---------------------------------------------------------------------
+plot_rate_panel <- function(draw_df,
+                            summ_df,
+                            site_choice = "Overall",
+                            parameter_choice,
+                            title = NULL,
+                            xlab = "Incidence per person-month",
+                            fill_value = "#CB181D",
+                            upper_cap = NULL) {
+  df <- draw_df %>%
+    filter(site == site_choice, parameter == parameter_choice)
+  
+  ann <- summ_df %>%
+    filter(site == site_choice, parameter == parameter_choice) %>%
+    mutate(
+      label = if (parameter_choice == "Mean decolonisation time (days)") {
+        sprintf("%.1f (%.1f–%.1f)", median, lo, hi)
+      } else {
+        sprintf("%.2f (%.2f–%.2f)", median, lo, hi)
+      },
+      x_pos = if (parameter_choice == "Mean decolonisation time (days)") {
+        hi * 1.3
+      } else {
+        hi * 1.2
+      }
+    )
+  
+  if (is.null(upper_cap)) upper_cap <- max(df$value, na.rm = TRUE) * 1.25
+  
+  ggplot(df, aes(x = parameter, y = value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.62, linewidth = 0.4, fill = fill_value) +
+    geom_text(
+      data = ann,
+      aes(x = parameter, y = x_pos, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      size = 3.8
+    ) +
+    coord_flip(ylim = c(0, upper_cap), clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+    labs(
+      title = title,
+      x = NULL,
+      y = xlab
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey75"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey90"),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.margin = margin(6, 24, 6, 6)
+    )
+}
+
+#---------------------------------------------------------------------
+# Site-specific panel for one rate outcome (faceted by site)
+#---------------------------------------------------------------------
+plot_site_specific_rate <- function(draw_df,
+                                    summ_df,
+                                    parameter_choice,
+                                    site_order = NULL,
+                                    title = NULL,
+                                    xlab = "Incidence per person-month",
+                                    fill_value = "#CB181D") {
+  df <- draw_df %>%
+    filter(site != "Overall", parameter == parameter_choice) %>%
+    mutate(site = if (is.null(site_order)) factor(site) else factor(site, levels = site_order))
+  
+  ann <- summ_df %>%
+    filter(site != "Overall", parameter == parameter_choice) %>%
+    mutate(
+      site = if (is.null(site_order)) factor(site) else factor(site, levels = site_order),
+      label = if (parameter_choice == "Mean decolonisation time (days)") {
+        sprintf("%.1f (%.1f–%.1f)", median, lo, hi)
+      } else {
+        sprintf("%.2f (%.2f–%.2f)", median, lo, hi)
+      },
+      x_pos = if (parameter_choice == "Mean decolonisation time (days)") {
+        hi * 1.12
+      } else {
+        hi * 1.05
+      }
+    )
+  
+  ggplot(df, aes(x = parameter, y = value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.62, linewidth = 0.4, fill = fill_value) +
+    geom_text(
+      data = ann,
+      aes(x = parameter, y = x_pos, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      size = 3.3
+    ) +
+    facet_wrap(~site, ncol = 1) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.16))) +
+    labs(
+      title = title,
+      x = NULL,
+      y = xlab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold", size = 14),
+      axis.title.y = element_text(size = 14),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey75"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey90"),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.margin = margin(6, 24, 6, 6)
+    )
+}
+
+#---------------------------------------------------------------------
+# Forest-plot panel for decolonisation time
+#---------------------------------------------------------------------
+plot_decolonisation_panel <- function(draw_df,
+                                      summ_df,
+                                      site_choice = "Overall",
+                                      title = NULL,
+                                      xlab = "Days",
+                                      upper_cap = NULL) {
+  df <- draw_df %>%
+    filter(site == site_choice, parameter == "Mean decolonisation time (days)")
+  
+  ann <- summ_df %>%
+    filter(site == site_choice, parameter == "Mean decolonisation time (days)") %>%
+    mutate(
+      label = sprintf("%.1f (%.1f–%.1f)", median, lo, hi),
+      x_pos = hi * 1.08
+    )
+  
+  if (is.null(upper_cap)) upper_cap <- max(df$value, na.rm = TRUE) * 1.25
+  
+  ggplot(df, aes(x = parameter, y = value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.62, linewidth = 0.4, fill = "#7F7F7F") +
+    geom_text(
+      data = ann,
+      aes(x = parameter, y = x_pos, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      size = 3.8
+    ) +
+    coord_flip(ylim = c(0, upper_cap), clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+    labs(
+      title = title,
+      x = NULL,
+      y = xlab
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey75"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey90"),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.margin = margin(6, 24, 6, 6)
+    )
+}
+
+#---------------------------------------------------------------------
+# Site-specific panels (faceted)
+#---------------------------------------------------------------------
+plot_site_specific_acquisition <- function(draw_df,
+                                           summ_df,
+                                           site_order = NULL,
+                                           title = "Site-specific baseline acquisition incidence",
+                                           xlab = "Incidence per person-month") {
+  df <- draw_df %>%
+    filter(site != "Overall", parameter != "Mean decolonisation time (days)") %>%
+    mutate(
+      site = if (is.null(site_order)) factor(site) else factor(site, levels = site_order),
+      parameter = factor(parameter, levels = c("Post-discharge acquisition", "Hospital acquisition"))
+    )
+  
+  ann <- summ_df %>%
+    filter(site != "Overall", parameter != "Mean decolonisation time (days)") %>%
+    mutate(
+      site = if (is.null(site_order)) factor(site) else factor(site, levels = site_order),
+      parameter = factor(parameter, levels = c("Post-discharge acquisition", "Hospital acquisition")),
+      label = sprintf("%.2f (%.2f–%.2f)", median, lo, hi),
+      x_pos = hi * 1.05
+    )
+  
+  ggplot(df, aes(x = parameter, y = value, fill = parameter)) +
+    geom_boxplot(outlier.shape = NA, width = 0.62, linewidth = 0.4) +
+    geom_text(
+      data = ann,
+      aes(x = parameter, y = x_pos, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      size = 3.3
+    ) +
+    facet_wrap(~site, ncol = 1) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.16))) +
+    scale_fill_manual(values = c(
+      "Post-discharge acquisition" = "#BDBDBD",
+      "Hospital acquisition" = "#CB181D"
+    )) +
+    labs(
+      title = title,
+      x = NULL,
+      y = xlab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold", size = 14),
+      axis.text.y = element_blank(),
+      axis.title.y = element_blank(),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey75"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey90"),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.margin = margin(6, 24, 6, 6)
+    )
+}
+
+plot_site_specific_decolonisation <- function(draw_df,
+                                              summ_df,
+                                              site_order = NULL,
+                                              title = "Site-specific decolonisation time",
+                                              xlab = "Days") {
+  df <- draw_df %>%
+    filter(site != "Overall", parameter == "Mean decolonisation time (days)") %>%
+    mutate(site = if (is.null(site_order)) factor(site) else factor(site, levels = site_order))
+  
+  ann <- summ_df %>%
+    filter(site != "Overall", parameter == "Mean decolonisation time (days)") %>%
+    mutate(
+      site = if (is.null(site_order)) factor(site, levels = site_order) else factor(site, levels = site_order),
+      label = sprintf("%.1f (%.1f–%.1f)", median, lo, hi),
+      x_pos = hi * 0.5
+    )
+  
+  ggplot(df, aes(x = parameter, y = value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.62, linewidth = 0.4, fill = "#7F7F7F") +
+    geom_text(
+      data = ann,
+      aes(x = parameter, y = x_pos, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      size = 3.3
+    ) +
+    facet_wrap(~site, ncol = 1) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.16))) +
+    labs(
+      title = title,
+      x = NULL,
+      y = xlab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold", size = 14),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey75"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey90"),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.margin = margin(6, 24, 6, 6)
+    )
+}
+
+#---------------------------------------------------------------------
+# Main wrapper: make slide-ready figures
+#---------------------------------------------------------------------
+make_baseline_decolonisation_figure <- function(fit,
+                                                site_names = NULL,
+                                                output_file = NULL,
+                                                days_per_month = 30.44) {
+  draw_df <- build_baseline_draws(fit, site_names = site_names, days_per_month = days_per_month)
+  summ_df  <- summarise_draws(draw_df)
+  
+  # Overall panels
+  overall_hosp <- plot_rate_panel(
+    draw_df, summ_df,
+    site_choice = "Overall",
+    parameter_choice = "Hospital acquisition",
+    title = "Overall hospital acquisition",
+    xlab = "Incidence per person-month",
+    fill_value = "#CB181D"
+  )
+  
+  overall_post <- plot_rate_panel(
+    draw_df, summ_df,
+    site_choice = "Overall",
+    parameter_choice = "Post-discharge acquisition",
+    title = "Overall post-discharge acquisition",
+    xlab = "Incidence per person-month",
+    fill_value = "#595959"
+  )
+  
+  overall_dec <- plot_rate_panel(
+    draw_df, summ_df,
+    site_choice = "Overall",
+    parameter_choice = "Mean decolonisation time (days)",
+    title = "Overall decolonisation time",
+    xlab = "Days",
+    fill_value = "#7F7F7F"
+  )
+  
+  # Site-specific panels
+  site_hosp <- plot_site_specific_rate(
+    draw_df, summ_df,
+    parameter_choice = "Hospital acquisition",
+    site_order = site_names,
+    title = "Site-specific hospital acquisition",
+    xlab = "Incidence per person-month",
+    fill_value = "#CB181D"
+  )
+  
+  site_post <- plot_site_specific_rate(
+    draw_df, summ_df,
+    parameter_choice = "Post-discharge acquisition",
+    site_order = site_names,
+    title = "Site-specific post-discharge acquisition",
+    xlab = "Incidence per person-month",
+    fill_value = "#595959"
+  )
+  
+  site_dec <- plot_site_specific_rate(
+    draw_df, summ_df,
+    parameter_choice = "Mean decolonisation time (days)",
+    site_order = site_names,
+    title = "Site-specific decolonisation time",
+    xlab = "Days",
+    fill_value = "#7F7F7F"
+  )
+  
+  # Recommended slide layout:
+  # Top row: hospital vs post-discharge
+  # Bottom row: decolonisation time
+  p_overall <- (overall_hosp | overall_post) / overall_dec +
+    plot_layout(heights = c(1, 0.9))
+  
+  # Appendix / backup slide: site-specific version
+  p_sites <- (site_hosp | site_post) / site_dec +
+    plot_layout(heights = c(1.2, 1))
+  
+  if (!is.null(output_file)) {
+    ggsave(
+      filename = output_file,
+      plot = p_sites,
+      width = 12,
+      height = 11,
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  list(
+    draw_df = draw_df,
+    summary_df = summ_df,
+    p_overall = p_overall,
+    p_sites = p_sites,
+    overall_hosp = overall_hosp,
+    overall_post = overall_post,
+    overall_dec = overall_dec,
+    site_hosp = site_hosp,
+    site_post = site_post,
+    site_dec = site_dec
+  )
+}
+
+#---------------------------------------------------------------------
+# Example usage
+#---------------------------------------------------------------------
+# Replace `fit_seasonal` with the name of your fitted Stan object.
+# Replace site names if you have a real mapping.
+#
+site_names <- c("Kilifi", "Migori", "Nairobi")
+res <- make_baseline_decolonisation_figure(
+  fit = fit_seasonal,
+  site_names = site_names,
+  output_file = "baseline_acquisition_decolonisation_forest.svg"
+)
+
+print(res$p_overall)
+print(res$p_sites)
+ggsave("../figs/baseline_rates.png", res$p_sites,
+       dpi = 300, 
+       width = 21.59 / 2.54, height = 13.32 / 2.54)
+
+#######################################################
+#Seasonality over all no random effect for seasonality
+#######################################################
+plot_seasonality_curve <- function(
+    fit,
+    site = 1,
+    pars = c("seasonal_amplitude_site", "seasonal_phase_site"),
+    year = 2024,
+    rainy = tibble(
+      start = as.Date(paste0(year, "-06-01")),
+      end   = as.Date(paste0(year, "-10-31"))
+    ),
+    normalize_to_year_median = TRUE,
+    title = "Estimated Seasonal Variation in ESBL-E Acquisition Risk",
+    subtitle = NULL,
+    ylab = "Hazard ratio (reference = yearly median)",
+    base_size = 12
+) {
+  draws <- rstan::extract(fit, pars = pars)
+  
+  if (!all(pars %in% names(draws))) {
+    stop("Could not find all requested parameters in the fit: ",
+         paste(pars, collapse = ", "))
+  }
+  
+  a1  <- draws[[pars[1]]][, site]
+  phi <- draws[[pars[2]]][, site]
+  
+  dates <- seq.Date(
+    as.Date(paste0(year, "-01-01")),
+    as.Date(paste0(year, "-12-31")),
+    by = "day"
+  )
+  
+  x <- as.numeric(format(dates, "%j")) / 365.25
+  
+  daily_hr <- sapply(seq_along(a1), function(i) {
+    exp(a1[i] * sin(2 * pi * x + phi[i]))
+  })
+  
+  if (normalize_to_year_median) {
+    daily_hr <- sweep(daily_hr, 2, apply(daily_hr, 2, median), "/")
+  }
+  
+  season_df <- tibble(
+    Date  = dates,
+    q_low = apply(daily_hr, 1, quantile, probs = 0.025, na.rm = TRUE),
+    q50   = apply(daily_hr, 1, median, na.rm = TRUE),
+    q_hi  = apply(daily_hr, 1, quantile, probs = 0.975, na.rm = TRUE)
+  )
+  
+  peak_idx   <- which.max(season_df$q50)
+  trough_idx <- which.min(season_df$q50)
+  
+  peak_date   <- season_df$Date[peak_idx]
+  trough_date <- season_df$Date[trough_idx]
+  
+  peak_hr   <- season_df$q50[peak_idx]
+  peak_lwr  <- season_df$q_low[peak_idx]
+  peak_upr  <- season_df$q_hi[peak_idx]
+  
+  trough_hr  <- season_df$q50[trough_idx]
+  trough_lwr <- season_df$q_low[trough_idx]
+  trough_upr <- season_df$q_hi[trough_idx]
+  
+  ymin <- min(season_df$q_low, na.rm = TRUE)
+  ymax <- max(season_df$q_hi, na.rm = TRUE)
+  pad  <- 0.12 * (ymax - ymin)
+  
+  lower_limit <- max(0, ymin - pad)
+  upper_limit <- ymax + pad
+  
+  y_span <- upper_limit - lower_limit
+  peak_y  <- min(upper_limit - 0.05 * y_span, peak_upr + 0.04 * y_span)
+  trough_y <- max(lower_limit + 0.07 * y_span, trough_lwr - 0.04 * y_span)
+  
+  if (is.null(subtitle)) {
+    subtitle <- paste0("Site ", site, " sinusoidal model (median HR with 95% CrI)")
+  }
+  
+  p <- ggplot(season_df, aes(x = Date, y = q50)) +
+    { if (!is.null(rainy) && nrow(rainy) > 0)
+      geom_rect(
+        data = rainy,
+        aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+        inherit.aes = FALSE,
+        fill = "forestgreen",
+        alpha = 0.12
+      )
+    } +
+    geom_ribbon(aes(ymin = q_low, ymax = q_hi), fill = "coral2", alpha = 0.25) +
+    geom_line(linewidth = 1.2, color = "coral2") +
+    geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.8) +
+    geom_vline(xintercept = peak_date, linetype = "dotdash",
+               col = "darkred", linewidth = 0.8, alpha = 0.7) +
+    geom_vline(xintercept = trough_date, linetype = "dotdash",
+               col = "darkred", linewidth = 0.8, alpha = 0.7) +
+    annotate(
+      "label",
+      x = peak_date, y = peak_y,
+      label = sprintf(
+        "HR = %.2f [%.2f–%.2f]",
+        format(peak_date, "%b"), peak_hr, peak_lwr, peak_upr
+      ),
+      vjust = 0, hjust = 0.5,
+      label.size = 0, alpha = 0.95,
+      color = "black", size = base_size / 3.2
+    ) +
+    annotate(
+      "label",
+      x = trough_date, y = trough_y,
+      label = sprintf(
+        "HR = %.2f [%.2f–%.2f]",
+        format(trough_date, "%b"), trough_hr, trough_lwr, trough_upr
+      ),
+      vjust = 1, hjust = 0.5,
+      label.size = 0, alpha = 0.95,
+      color = "black", size = base_size / 3.2
+    ) +
+    { if (!is.null(rainy) && nrow(rainy) > 0)
+      annotate(
+        "text",
+        x = min(rainy$start),
+        y = lower_limit + 0.06 * y_span,
+        label = "Rainy season",
+        color = "darkgreen",
+        fontface = "bold",
+        hjust = 0,
+        size = base_size / 3.2
+      )
+    } +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0.02, 0.02)) +
+    scale_y_continuous(limits = c(lower_limit, upper_limit),
+                       expand = expansion(mult = c(0, 0))) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = NULL,
+      subtitle = NULL,
+      x = "Calendar month",
+      y = ylab,
+      caption = "Shaded region indicates the rainy season"
+    ) +
+    theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(size = base_size + 2, face = "bold"),
+      plot.subtitle = element_text(size = base_size),
+      axis.title = element_text(size = base_size),
+      axis.text = element_text(size = base_size - 1),
+      panel.grid.major = element_line(linetype = "dotted", color = "grey70"),
+      panel.grid.minor = element_line(linetype = "dotted", color = "grey85"),
+      plot.margin = grid::unit(c(10, 10, 18, 10), "pt")
+    )
+  
+  list(data = season_df, plot = p)
+}
+
+season_res <- plot_seasonality_curve(
+  fit = fit_seasonal,
+  site = 1,
+  year = 2024,
+  rainy = tibble(
+    start = as.Date("2024-06-01"),
+    end   = as.Date("2024-10-31")
+  ),
+  normalize_to_year_median = TRUE,
+  title = "Estimated Seasonal Variation in ESBL-E Acquisition Risk",
+  subtitle = "Sinusoidal model (median HR with 95% CrI)"
+)
+
+print(season_res$plot)
+
+####################
+###per site seasonality after adding the random effect
+####################
+
+plot_seasonality_curve_sites <- function(
+    fit,
+    pars = c("seasonal_amplitude_site", "seasonal_phase_site"),
+    year = 2024,
+    normalize_to_year_median = TRUE,
+    title = "Estimated Seasonal Variation in ESBL-E Acquisition Risk",
+    subtitle = "Site-specific sinusoidal model (median HR with 95% CrI)",
+    ylab = "Hazard ratio (reference = yearly median)",
+    base_size = 10
+) {
+  
+  site_labels <- c(
+    "Kilifi (1)",
+    "Migori (2)",
+    "Nairobi (3)"
+  )
+  
+  # --- SITE-SPECIFIC RAINY SEASONS ---
+  rainy <- tibble::tibble(
+    Site = factor(rep(1:3, each = 2), levels = 1:3, labels = site_labels),
+    start = as.Date(c(
+      paste0(year, "-04-01"), paste0(year, "-11-01"),  # Kilifi
+      paste0(year, "-03-01"), paste0(year, "-10-01"),  # Migori
+      paste0(year, "-03-25"), paste0(year, "-11-01")   # Nairobi
+    )),
+    end = as.Date(c(
+      paste0(year, "-06-10"), paste0(year, "-12-31"),  # Kilifi
+      paste0(year, "-05-31"), paste0(year, "-12-31"),  # Migori
+      paste0(year, "-05-31"), paste0(year, "-12-31")   # Nairobi
+    ))
+  )
+  
+  draws <- rstan::extract(fit, pars = pars)
+  
+  a1_mat  <- draws[[pars[1]]]
+  phi_mat <- draws[[pars[2]]]
+  
+  n_sites <- ncol(a1_mat)
+  
+  dates <- seq.Date(
+    as.Date(paste0(year, "-01-01")),
+    as.Date(paste0(year, "-12-31")),
+    by = "day"
+  )
+  x <- as.numeric(format(dates, "%j")) / 365.25
+  
+  season_list <- vector("list", n_sites)
+  label_list  <- vector("list", n_sites)
+  
+  for (s in seq_len(n_sites)) {
+    
+    site_name <- site_labels[s]
+    
+    a1  <- a1_mat[, s]
+    phi <- phi_mat[, s]
+    
+    daily_hr <- sapply(seq_along(a1), function(i) {
+      exp(a1[i] * sin(2 * pi * x + phi[i]))
+    })
+    
+    if (normalize_to_year_median) {
+      daily_hr <- sweep(daily_hr, 2, apply(daily_hr, 2, median), "/")
+    }
+    
+    season_df <- tibble(
+      Site  = factor(site_name, levels = site_labels),
+      Date  = dates,
+      q_low = apply(daily_hr, 1, quantile, probs = 0.025),
+      q50   = apply(daily_hr, 1, median),
+      q_hi  = apply(daily_hr, 1, quantile, probs = 0.975)
+    )
+    
+    # --- peak/trough logic unchanged ---
+    peak_idx   <- which.max(season_df$q50)
+    trough_idx <- which.min(season_df$q50)
+    
+    peak_date   <- season_df$Date[peak_idx]
+    trough_date <- season_df$Date[trough_idx]
+    
+    peak_hr   <- season_df$q50[peak_idx]
+    peak_lwr  <- season_df$q_low[peak_idx]
+    peak_upr  <- season_df$q_hi[peak_idx]
+    
+    trough_hr  <- season_df$q50[trough_idx]
+    trough_lwr <- season_df$q_low[trough_idx]
+    trough_upr <- season_df$q_hi[trough_idx]
+    
+    ymin <- min(season_df$q_low)
+    ymax <- max(season_df$q_hi)
+    pad  <- 0.12 * (ymax - ymin)
+    
+    lower_limit <- max(0, ymin - pad)
+    upper_limit <- ymax + pad
+    y_span <- upper_limit - lower_limit
+    
+    peak_y   <- min(upper_limit - 0.05 * y_span, peak_upr + 0.01 * y_span)
+    trough_y <- max(lower_limit + 0.07 * y_span, trough_lwr - 0.01 * y_span)
+    
+    season_list[[s]] <- season_df
+    
+    label_list[[s]] <- tibble(
+      Site = factor(site_name, levels = site_labels),
+      peak_date = peak_date,
+      trough_date = trough_date,
+      peak_y = peak_y,
+      trough_y = trough_y,
+      peak_hr = peak_hr,
+      peak_lwr = peak_lwr,
+      peak_upr = peak_upr,
+      trough_hr = trough_hr,
+      trough_lwr = trough_lwr,
+      trough_upr = trough_upr
+    )
+  }
+  
+  season_df <- dplyr::bind_rows(season_list)
+  label_df  <- dplyr::bind_rows(label_list)
+  
+  p <- ggplot(season_df, aes(x = Date, y = q50)) +
+    
+    # --- site-specific rainy shading ---
+    geom_rect(
+      data = rainy,
+      aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+      inherit.aes = FALSE,
+      fill = "forestgreen",
+      alpha = 0.12
+    ) +
+    
+    geom_ribbon(aes(ymin = q_low, ymax = q_hi), fill = "coral2", alpha = 0.25) +
+    geom_line(linewidth = 1.0, color = "coral2") +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    
+    geom_vline(data = label_df, aes(xintercept = peak_date),
+               linetype = "dotdash", col = "darkred", alpha = 0.7) +
+    geom_vline(data = label_df, aes(xintercept = trough_date),
+               linetype = "dotdash", col = "darkred", alpha = 0.7) +
+    
+    geom_label(
+      data = label_df,
+      aes(x = peak_date, y = peak_y,
+         # label = sprintf("Peak: %s\nHR %.2f [%.2f–%.2f]",
+          #                format(peak_date, "%b"), peak_hr, peak_lwr, peak_upr)),
+          label = sprintf("HR %.2f [%.2f–%.2f]",
+                          peak_hr, peak_lwr, peak_upr)),
+      label.size = 0, size = base_size / 3.2
+    ) +
+    
+    geom_label(
+      data = label_df,
+      aes(x = trough_date, y = trough_y,
+          #label = sprintf("Trough: %s\nHR %.2f [%.2f–%.2f]",
+          #                format(trough_date, "%b"), trough_hr, trough_lwr, trough_upr)),
+          label = sprintf("HR %.2f [%.2f–%.2f]",
+                          trough_hr, trough_lwr, trough_upr)),
+      label.size = 0, size = base_size / 3.2
+    ) +
+    
+    facet_wrap(~Site, ncol = 1) +
+    
+    scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+    
+    labs(
+      title = NULL,
+      subtitle = NULL,
+      x = "Calendar month",
+      y = ylab
+    ) +
+    
+    theme_minimal(base_size = base_size) +
+    theme(strip.text = element_text(face = "bold", size = base_size * 1.3),
+          axis.text.x = element_text(size = base_size * 1.2),
+          axis.text.y = element_text(size = base_size * 1.2),
+          
+          axis.title.x = element_text(size = base_size * 1.4),
+          axis.title.y = element_text(size = base_size * 1.4))
+  
+  list(data = season_df, plot = p)
+}
+
+season_res <- plot_seasonality_curve_sites(
+  fit = fit_seasonal,
+  year = 2024,
+  normalize_to_year_median = TRUE,
+  title = "Estimated Seasonal Variation in ESBL-E Acquisition Risk",
+  subtitle = "Site-specific sinusoidal model (median HR with 95% CrI)"
+)
+
+print(season_res$plot)
+ggsave("../figs/seasonal_res.png", season_res$plot,
+       dpi = 300, 
+       width = 21.59 / 2.54, height = 13.32 / 2.54)
